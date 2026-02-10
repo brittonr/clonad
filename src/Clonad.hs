@@ -29,35 +29,36 @@
 -- sentiment :: Text -> Clonad Double
 -- sentiment = clonad "return a sentiment score from -1.0 to 1.0"
 -- @
-
 module Clonad
   ( -- * The Clonad Monad
-    Clonad
-  , ClonadEnv (..)
-  , Backend (..)
+    Clonad,
+    ClonadEnv (..),
+    Backend (..),
 
     -- * The Claude FFI
-  , clonad
-  , clonad_
-  , clonadWith
+    clonad,
+    clonad_,
+    clonadWith,
 
     -- * Serialisation
-  , ClonadParam (..)
-  , ClonadReturn (..)
+    ClonadParam (..),
+    ClonadReturn (..),
 
     -- * Environment
-  , defaultEnv
-  , mkEnv
-  , mkOllamaEnv
+    defaultEnv,
+    mkEnv,
+    mkOllamaEnv,
+    mkOpenAIEnv,
 
     -- * Runner
-  , runClonad
+    runClonad,
 
     -- * Combinators
-  , withModel
-  , withTemperature
-  , withSystemPrompt
-  ) where
+    withModel,
+    withTemperature,
+    withSystemPrompt,
+  )
+where
 
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (MonadReader, ReaderT (..), local)
@@ -100,11 +101,17 @@ class ClonadReturn a where
 -- ---------------------------------------------------------------------------
 
 instance ClonadParam Text where serialise = id
+
 instance ClonadParam String where serialise = T.pack
+
 instance ClonadParam Int where serialise = T.pack . show
+
 instance ClonadParam Integer where serialise = T.pack . show
+
 instance ClonadParam Double where serialise = T.pack . show
+
 instance ClonadParam Bool where serialise = T.pack . show
+
 instance ClonadParam () where serialise = const "()"
 
 instance (ClonadParam a) => ClonadParam [a] where
@@ -154,9 +161,10 @@ instance (FromJSON a) => ClonadReturn [a] where
 
 instance (FromJSON a, FromJSON b) => ClonadReturn (a, b) where
   returnSpec _ = "Return ONLY a JSON array of exactly two elements. No markdown, no explanation."
-  deserialise t = eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t) >>= \case
-    [a, b] -> (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
-    _ -> Left "Expected a two-element array"
+  deserialise t =
+    eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t) >>= \case
+      [a, b] -> (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
+      _ -> Left "Expected a two-element array"
 
 -- | Helper for Read-based parsing
 parseWith :: forall a. (Read a) => String -> Text -> Either String a
@@ -182,16 +190,20 @@ data Backend
     Anthropic
   | -- | Use Ollama at the given base URL (e.g., "http://localhost:11434")
     Ollama Text
+  | -- | Use OpenAI at api.openai.com or a custom OpenAI-compatible endpoint
+    OpenAI
+      -- | Optional custom base URL; Nothing means api.openai.com
+      (Maybe Text)
   deriving stock (Show, Eq)
 
 -- | The execution environment.
 data ClonadEnv = ClonadEnv
-  { envBackend :: !Backend
-  , envApiKey :: !Text
-  , envModel :: !Text
-  , envTemperature :: !(Maybe Double)
-  , envMaxTokens :: !Int
-  , envSystemPrompt :: !(Maybe Text)
+  { envBackend :: !Backend,
+    envApiKey :: !Text,
+    envModel :: !Text,
+    envTemperature :: !(Maybe Double),
+    envMaxTokens :: !Int,
+    envSystemPrompt :: !(Maybe Text)
   }
   deriving stock (Show)
 
@@ -200,39 +212,56 @@ data ClonadEnv = ClonadEnv
 -- ---------------------------------------------------------------------------
 
 -- | Read environment variables and construct a 'ClonadEnv'.
--- Checks @OLLAMA_HOST@ first (for local Ollama), then @ANTHROPIC_API_KEY@.
+-- Checks @OLLAMA_HOST@ first (for local Ollama), then @OPENAI_API_KEY@, then @ANTHROPIC_API_KEY@.
 defaultEnv :: IO ClonadEnv
 defaultEnv = do
   mOllama <- lookupEnv "OLLAMA_HOST"
   mModel <- lookupEnv "CLONAD_MODEL"
+  mOpenAIBase <- lookupEnv "OPENAI_BASE_URL"
   case mOllama of
     Just url -> pure $ mkOllamaEnv (T.pack url) (maybe "qwen2.5:0.5b" T.pack mModel)
-    Nothing -> lookupEnv "ANTHROPIC_API_KEY" >>= \case
-      Nothing -> error "Clonad: neither OLLAMA_HOST nor ANTHROPIC_API_KEY set"
-      Just key -> pure $ mkEnv (T.pack key)
+    Nothing ->
+      lookupEnv "OPENAI_API_KEY" >>= \case
+        Just key -> pure $ mkOpenAIEnv (T.pack key) (maybe "gpt-4o-mini" T.pack mModel) (T.pack <$> mOpenAIBase)
+        Nothing ->
+          lookupEnv "ANTHROPIC_API_KEY" >>= \case
+            Nothing -> error "Clonad: none of OLLAMA_HOST, OPENAI_API_KEY, or ANTHROPIC_API_KEY set"
+            Just key -> pure $ mkEnv (T.pack key)
 
 -- | Construct a 'ClonadEnv' for Anthropic.
 mkEnv :: Text -> ClonadEnv
 mkEnv key =
   ClonadEnv
-    { envBackend = Anthropic
-    , envApiKey = key
-    , envModel = "claude-sonnet-4-20250514"
-    , envTemperature = Nothing
-    , envMaxTokens = 1024
-    , envSystemPrompt = Nothing
+    { envBackend = Anthropic,
+      envApiKey = key,
+      envModel = "claude-sonnet-4-20250514",
+      envTemperature = Nothing,
+      envMaxTokens = 1024,
+      envSystemPrompt = Nothing
     }
 
 -- | Construct a 'ClonadEnv' for Ollama.
 mkOllamaEnv :: Text -> Text -> ClonadEnv
 mkOllamaEnv baseUrl model =
   ClonadEnv
-    { envBackend = Ollama baseUrl
-    , envApiKey = ""
-    , envModel = model
-    , envTemperature = Nothing
-    , envMaxTokens = 1024
-    , envSystemPrompt = Nothing
+    { envBackend = Ollama baseUrl,
+      envApiKey = "",
+      envModel = model,
+      envTemperature = Nothing,
+      envMaxTokens = 1024,
+      envSystemPrompt = Nothing
+    }
+
+-- | Construct a 'ClonadEnv' for OpenAI or an OpenAI-compatible endpoint.
+mkOpenAIEnv :: Text -> Text -> Maybe Text -> ClonadEnv
+mkOpenAIEnv key model mBaseUrl =
+  ClonadEnv
+    { envBackend = OpenAI mBaseUrl,
+      envApiKey = key,
+      envModel = model,
+      envTemperature = Nothing,
+      envMaxTokens = 1024,
+      envSystemPrompt = Nothing
     }
 
 -- ---------------------------------------------------------------------------
@@ -289,15 +318,15 @@ clonadWith spec _context input = Clonad $ ReaderT \env -> do
       systemMsg =
         T.unlines $
           catMaybes
-            [ envSystemPrompt env
-            , Just $
+            [ envSystemPrompt env,
+              Just $
                 T.unlines
-                  [ "You are a pure computation engine embedded in a Haskell program via FFI."
-                  , "You receive an input and a specification."
-                  , "You return ONLY the computed result."
-                  , "No explanation. No preamble. No apologies. No markdown formatting unless the specification requires it."
-                  , ""
-                  , "OUTPUT FORMAT: " <> rspec
+                  [ "You are a pure computation engine embedded in a Haskell program via FFI.",
+                    "You receive an input and a specification.",
+                    "You return ONLY the computed result.",
+                    "No explanation. No preamble. No apologies. No markdown formatting unless the specification requires it.",
+                    "",
+                    "OUTPUT FORMAT: " <> rspec
                   ]
             ]
       userMsg
@@ -354,6 +383,7 @@ callLLM :: ClonadEnv -> Text -> Text -> IO Text
 callLLM env systemMsg userMsg = case envBackend env of
   Anthropic -> callAnthropic env systemMsg userMsg
   Ollama base -> callOllama env base systemMsg userMsg
+  OpenAI mBase -> callOpenAI env mBase systemMsg userMsg
 
 callAnthropic :: ClonadEnv -> Text -> Text -> IO Text
 callAnthropic env systemMsg userMsg = runReq defaultHttpConfig do
@@ -364,10 +394,10 @@ callAnthropic env systemMsg userMsg = runReq defaultHttpConfig do
           <> header "content-type" "application/json"
       body =
         object $
-          [ "model" .= envModel env
-          , "max_tokens" .= envMaxTokens env
-          , "system" .= systemMsg
-          , "messages" .= [object ["role" .= ("user" :: Text), "content" .= userMsg]]
+          [ "model" .= envModel env,
+            "max_tokens" .= envMaxTokens env,
+            "system" .= systemMsg,
+            "messages" .= [object ["role" .= ("user" :: Text), "content" .= userMsg]]
           ]
             <> ["temperature" .= t | Just t <- [envTemperature env]]
   resp <- req POST url (ReqBodyJson body) jsonResponse headers
@@ -382,8 +412,8 @@ callOllama env baseUrl systemMsg userMsg = runReq defaultHttpConfig do
       (host, portPart) = T.breakOn ":" hostPort
       portNum = fromMaybe 11434 $ readMaybe (T.unpack $ T.drop 1 portPart)
       messages =
-        [ object ["role" .= ("system" :: Text), "content" .= systemMsg]
-        , object ["role" .= ("user" :: Text), "content" .= userMsg]
+        [ object ["role" .= ("system" :: Text), "content" .= systemMsg],
+          object ["role" .= ("user" :: Text), "content" .= userMsg]
         ]
       body =
         object $
@@ -394,6 +424,37 @@ callOllama env baseUrl systemMsg userMsg = runReq defaultHttpConfig do
     if scheme == "https"
       then req POST (https host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
       else req POST (http host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port portNum)
+  let OllamaResponse choices = responseBody resp
+  pure $ case choices of
+    (OllamaChoice (OllamaMessage content) : _) -> content
+    [] -> ""
+
+callOpenAI :: ClonadEnv -> Maybe Text -> Text -> Text -> IO Text
+callOpenAI env mBaseUrl systemMsg userMsg = runReq defaultHttpConfig do
+  let messages =
+        [ object ["role" .= ("system" :: Text), "content" .= systemMsg],
+          object ["role" .= ("user" :: Text), "content" .= userMsg]
+        ]
+      body =
+        object $
+          ["model" .= envModel env, "messages" .= messages]
+            <> ["temperature" .= t | Just t <- [envTemperature env]]
+      authHeader = header "Authorization" ("Bearer " <> TE.encodeUtf8 (envApiKey env))
+      headers = authHeader <> header "content-type" "application/json"
+  resp <- case mBaseUrl of
+    Nothing ->
+      -- Default OpenAI endpoint
+      req POST (https "api.openai.com" /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
+    Just baseUrl -> do
+      -- Custom OpenAI-compatible endpoint
+      let stripped = T.dropWhileEnd (== '/') baseUrl
+          (scheme, rest) = T.breakOn "://" stripped
+          hostPort = T.drop 3 rest
+          (host, portPart) = T.breakOn ":" hostPort
+          portNum = fromMaybe 443 $ readMaybe (T.unpack $ T.drop 1 portPart)
+      if scheme == "https"
+        then req POST (https host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
+        else req POST (http host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port portNum)
   let OllamaResponse choices = responseBody resp
   pure $ case choices of
     (OllamaChoice (OllamaMessage content) : _) -> content
