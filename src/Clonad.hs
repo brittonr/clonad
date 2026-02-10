@@ -860,9 +860,12 @@ runJsonPost ::
   Option 'Https ->
   Option 'Http ->
   IO LBS.ByteString
-runJsonPost url body httpsOpts httpOpts = runReq defaultHttpConfig $ case url of
-  ReqUrlHttps u -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse httpsOpts
-  ReqUrlHttp u p -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse (httpOpts <> port p)
+runJsonPost url body httpsOpts httpOpts = do
+  -- 60 second timeout (in microseconds)
+  let timeout = responseTimeout 60000000
+  runReq defaultHttpConfig $ case url of
+    ReqUrlHttps u -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse (httpsOpts <> timeout)
+    ReqUrlHttp u p -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse (httpOpts <> port p <> timeout)
 
 -- | Parse a base URL into its components.
 -- Returns Left with an error message if the URL is invalid.
