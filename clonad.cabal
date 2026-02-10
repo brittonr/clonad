@@ -25,17 +25,3 @@ library
     , text       >= 1.2   && < 2.2
   ghc-options:      -Wall
 
-executable clonad-server
-  main-is:          Main.hs
-  hs-source-dirs:   app
-  default-language: GHC2021
-  build-depends:
-      base       >= 4.17  && < 5
-    , aeson      >= 2.0   && < 2.3
-    , bytestring >= 0.10  && < 0.13
-    , clonad
-    , http-types >= 0.12  && < 0.13
-    , scotty     >= 0.20  && < 0.23
-    , text       >= 1.2   && < 2.2
-    , wai        >= 3.2   && < 3.3
-  ghc-options:      -Wall -threaded -rtsopts -with-rtsopts=-N
