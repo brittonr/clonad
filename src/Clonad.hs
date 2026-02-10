@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -56,7 +57,6 @@ module Clonad
     -- * The Claude FFI
     clonad,
     clonad_,
-    clonadWith,
 
     -- * Serialisation
     ClonadParam (..),
@@ -78,13 +78,14 @@ module Clonad
   )
 where
 
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, SomeException, throwIO, try)
 import Control.Monad.Catch (MonadCatch, MonadThrow, throwM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (MonadReader, ReaderT (..), ask, local)
 import Data.Aeson (FromJSON (..), eitherDecodeStrict, object, (.:), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (parseEither)
+import Data.Bifunctor (first)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Proxy (Proxy (..))
 import Data.String (IsString (..))
@@ -158,7 +159,7 @@ data ClonadError
     ClonadParseError
       { parseSpec :: Text,
         parseRaw :: Text,
-        parseError :: String
+        parseError :: Text
       }
   | -- | API request failed
     ClonadApiError
@@ -185,13 +186,13 @@ class ClonadParam a where
 -- | Types that can be parsed from Claude's response.
 class ClonadReturn a where
   returnSpec :: Proxy a -> Text
-  deserialise :: Text -> Either String a
+  deserialise :: Text -> Either Text a
 
   default returnSpec :: (Typeable a) => Proxy a -> Text
   returnSpec p = "Return ONLY a valid JSON value of Haskell type: " <> T.pack (show (typeRep p))
 
-  default deserialise :: (FromJSON a) => Text -> Either String a
-  deserialise = eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+  default deserialise :: (FromJSON a) => Text -> Either Text a
+  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
 
 -- ---------------------------------------------------------------------------
 -- ClonadParam instances
@@ -246,27 +247,35 @@ instance ClonadReturn Bool where
   deserialise t = case T.toLower (T.strip t) of
     "true" -> Right True
     "false" -> Right False
-    other -> Left $ "Not a Bool: " <> T.unpack other
+    other -> Left $ "Not a Bool: " <> other
 
 instance ClonadReturn () where
   returnSpec _ = "Do not return any value."
   deserialise = const (Right ())
 
+instance (ClonadReturn a) => ClonadReturn (Maybe a) where
+  returnSpec _ = "Return ONLY a JSON value or null. No markdown, no explanation."
+  deserialise t =
+    let stripped = T.strip t
+     in if stripped == "null" || stripped == "Nothing"
+          then Right Nothing
+          else Just <$> deserialise stripped
+
 instance (FromJSON a) => ClonadReturn [a] where
   returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
-  deserialise = eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
 
 instance (FromJSON a, FromJSON b) => ClonadReturn (a, b) where
   returnSpec _ = "Return ONLY a JSON array of exactly two elements. No markdown, no explanation."
   deserialise t =
-    eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t) >>= \case
-      [a, b] -> (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
+    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+      [a, b] -> first T.pack $ (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
       _ -> Left "Expected a two-element array"
 
 -- | Helper for Read-based parsing
-parseWith :: forall a. (Read a) => String -> Text -> Either String a
+parseWith :: forall a. (Read a) => Text -> Text -> Either Text a
 parseWith typeName t =
-  maybe (Left $ "Not a " <> typeName <> ": " <> show t) Right $
+  maybe (Left $ "Not a " <> typeName <> ": " <> t) Right $
     readMaybe (T.unpack $ T.strip t)
 
 -- ---------------------------------------------------------------------------
@@ -410,7 +419,7 @@ runClonad env (Clonad m) = runReaderT m env
 -- isSpam = clonad "is this email spam?"
 -- @
 clonad :: forall a b. (ClonadParam a, ClonadReturn b) => Text -> a -> Clonad b
-clonad spec = clonadWith spec []
+clonad = clonadImpl
 
 -- | Like 'clonad' but takes no input. Useful for generation tasks.
 --
@@ -419,17 +428,16 @@ clonad spec = clonadWith spec []
 -- poem = clonad_ "write a haiku about Haskell"
 -- @
 clonad_ :: forall b. (ClonadReturn b) => Text -> Clonad b
-clonad_ spec = clonadWith spec [] ()
+clonad_ spec = clonadImpl spec ()
 
--- | Like 'clonad' but with additional conversation context prepended.
-clonadWith ::
+-- | Internal implementation of the Claude FFI.
+clonadImpl ::
   forall a b.
   (ClonadParam a, ClonadReturn b) =>
   Text ->
-  [(Text, Text)] ->
   a ->
   Clonad b
-clonadWith spec _context input = do
+clonadImpl spec input = do
   env <- ask
   let rspec = returnSpec (Proxy @b)
       serialised = serialise input
@@ -466,9 +474,12 @@ clonadWith spec _context input = do
 -- ---------------------------------------------------------------------------
 
 -- Anthropic response types
-newtype ApiResponse = ApiResponse [ContentBlock]
+newtype ApiResponse = ApiResponse {blocks :: [ContentBlock]}
 
-data ContentBlock = ContentBlock Text Text -- type, text
+data ContentBlock = ContentBlock
+  { blockType :: Text,
+    blockText :: Text
+  }
 
 instance FromJSON ApiResponse where
   parseJSON = Aeson.withObject "ApiResponse" \o -> ApiResponse <$> o .: "content"
@@ -478,20 +489,20 @@ instance FromJSON ContentBlock where
     ContentBlock <$> o .: "type" <*> o .: "text"
 
 -- OpenAI/Ollama response types
-newtype OllamaResponse = OllamaResponse [OllamaChoice]
+newtype ChatResponse = ChatResponse {choices :: [ChatChoice]}
 
-newtype OllamaChoice = OllamaChoice OllamaMessage
+data ChatChoice = ChatChoice {message :: ChatMessage}
 
-newtype OllamaMessage = OllamaMessage Text
+newtype ChatMessage = ChatMessage {content :: Text}
 
-instance FromJSON OllamaResponse where
-  parseJSON = Aeson.withObject "OllamaResponse" \o -> OllamaResponse <$> o .: "choices"
+instance FromJSON ChatResponse where
+  parseJSON = Aeson.withObject "ChatResponse" \o -> ChatResponse <$> o .: "choices"
 
-instance FromJSON OllamaChoice where
-  parseJSON = Aeson.withObject "OllamaChoice" \o -> OllamaChoice <$> o .: "message"
+instance FromJSON ChatChoice where
+  parseJSON = Aeson.withObject "ChatChoice" \o -> ChatChoice <$> o .: "message"
 
-instance FromJSON OllamaMessage where
-  parseJSON = Aeson.withObject "OllamaMessage" \o -> OllamaMessage <$> o .: "content"
+instance FromJSON ChatMessage where
+  parseJSON = Aeson.withObject "ChatMessage" \o -> ChatMessage <$> o .: "content"
 
 -- ---------------------------------------------------------------------------
 -- URL Parsing Helper
@@ -527,11 +538,16 @@ parseBaseUrl baseUrl defaultPort =
 -- Backend Implementations
 -- ---------------------------------------------------------------------------
 
+-- | Call the LLM backend, wrapping HTTP exceptions in ClonadApiError.
 callLLM :: ClonadEnv -> Text -> Text -> IO Text
-callLLM env systemMsg userMsg = case env.backend of
-  Anthropic -> callAnthropic env systemMsg userMsg
-  Ollama base -> callOllama env base systemMsg userMsg
-  OpenAI mBase -> callOpenAI env mBase systemMsg userMsg
+callLLM env systemMsg userMsg = do
+  result <- try @SomeException $ case env.backend of
+    Anthropic -> callAnthropic env systemMsg userMsg
+    Ollama base -> callOllama env base systemMsg userMsg
+    OpenAI mBase -> callOpenAI env mBase systemMsg userMsg
+  case result of
+    Left err -> throwIO $ ClonadApiError (T.pack $ show err)
+    Right txt -> pure txt
 
 callAnthropic :: ClonadEnv -> Text -> Text -> IO Text
 callAnthropic env systemMsg userMsg = runReq defaultHttpConfig do
@@ -549,8 +565,8 @@ callAnthropic env systemMsg userMsg = runReq defaultHttpConfig do
           ]
             <> ["temperature" .= unTemperature t | Just t <- [env.temperature]]
   resp <- req POST url (ReqBodyJson body) jsonResponse headers
-  let ApiResponse blocks = responseBody resp
-  pure $ T.intercalate "\n" [txt | ContentBlock typ txt <- blocks, typ == "text"]
+  let ApiResponse contentBlocks = responseBody resp
+  pure $ T.intercalate "\n" [blk.blockText | blk <- contentBlocks, blk.blockType == "text"]
 
 callOllama :: ClonadEnv -> Text -> Text -> Text -> IO Text
 callOllama env baseUrl systemMsg userMsg = runReq defaultHttpConfig do
@@ -569,10 +585,7 @@ callOllama env baseUrl systemMsg userMsg = runReq defaultHttpConfig do
       req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
     UrlHttp ->
       req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
-  let OllamaResponse choices = responseBody resp
-  pure $ case choices of
-    (OllamaChoice (OllamaMessage content) : _) -> content
-    [] -> ""
+  pure $ extractChatContent (responseBody resp)
 
 callOpenAI :: ClonadEnv -> Maybe Text -> Text -> Text -> IO Text
 callOpenAI env mBaseUrl systemMsg userMsg = runReq defaultHttpConfig do
@@ -598,23 +611,33 @@ callOpenAI env mBaseUrl systemMsg userMsg = runReq defaultHttpConfig do
           req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
         UrlHttp ->
           req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
-  let OllamaResponse choices = responseBody resp
-  pure $ case choices of
-    (OllamaChoice (OllamaMessage content) : _) -> content
-    [] -> ""
+  pure $ extractChatContent (responseBody resp)
+
+-- | Extract text content from a chat completion response.
+extractChatContent :: ChatResponse -> Text
+extractChatContent resp = case resp.choices of
+  (choice : _) -> choice.message.content
+  [] -> ""
 
 -- ---------------------------------------------------------------------------
 -- Utilities
 -- ---------------------------------------------------------------------------
 
+-- | Strip markdown code fences from LLM output.
 stripCodeFences :: Text -> Text
 stripCodeFences t = case T.lines (T.strip t) of
-  (first : rest)
-    | "```" `T.isPrefixOf` first -> T.strip . T.unlines $ dropLast rest
+  (firstLine : rest)
+    | "```" `T.isPrefixOf` firstLine -> T.strip . T.unlines $ dropTrailingFence rest
   other -> T.unlines other
   where
-    dropLast [] = []
-    dropLast xs = init xs
+    -- Safe version that doesn't use partial `init`
+    dropTrailingFence [] = []
+    dropTrailingFence xs
+      | "```" `T.isPrefixOf` last xs = initSafe xs
+      | otherwise = xs
+    initSafe [] = []
+    initSafe [_] = []
+    initSafe (x : xs) = x : initSafe xs
 
 -- ---------------------------------------------------------------------------
 -- Combinators
