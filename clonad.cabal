@@ -1,0 +1,41 @@
+cabal-version:      3.0
+name:               clonad
+version:            0.1.0.0
+synopsis:           A Claude Foreign Function Interface for Haskell
+description:
+  The Clonad monad provides a natural-language foreign function interface
+  to the Claude API. Instead of implementing functions in Haskell, describe
+  their behaviour in plain English and let Claude compute the result at
+  runtime. The type signature is the contract.
+
+license:            BSD-3-Clause
+author:             You
+build-type:         Simple
+
+library
+  exposed-modules:  Clonad
+  hs-source-dirs:   src
+  default-language: GHC2021
+  build-depends:
+      base       >= 4.17  && < 5
+    , aeson      >= 2.0   && < 2.3
+    , bytestring >= 0.10  && < 0.13
+    , mtl        >= 2.2   && < 2.4
+    , req        >= 3.9   && < 3.14
+    , text       >= 1.2   && < 2.2
+  ghc-options:      -Wall
+
+executable clonad-server
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: GHC2021
+  build-depends:
+      base       >= 4.17  && < 5
+    , aeson      >= 2.0   && < 2.3
+    , bytestring >= 0.10  && < 0.13
+    , clonad
+    , http-types >= 0.12  && < 0.13
+    , scotty     >= 0.20  && < 0.23
+    , text       >= 1.2   && < 2.2
+    , wai        >= 3.2   && < 3.3
+  ghc-options:      -Wall -threaded -rtsopts -with-rtsopts=-N
