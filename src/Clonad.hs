@@ -59,6 +59,8 @@ module Clonad
     -- * The Claude FFI
     clonad,
     clonad_,
+    tryClonad,
+    tryClonad_,
 
     -- * Serialisation
     ClonadParam (..),
@@ -73,6 +75,7 @@ module Clonad
 
     -- * Runner
     runClonad,
+    runClonadEither,
 
     -- * Combinators
     withModel,
@@ -92,16 +95,26 @@ import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (parseEither)
 import Data.Bifunctor (first)
 import Data.ByteString.Lazy qualified as LBS
+import Data.Int (Int16, Int32, Int64, Int8)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.List.NonEmpty qualified as NE
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Proxy (Proxy (..))
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.String (IsString (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Typeable (Typeable, typeRep)
+import Data.Vector (Vector)
+import Data.Vector qualified as V
+import Data.Word (Word16, Word32, Word64, Word8)
+import GHC.Stack (CallStack, HasCallStack, callStack, prettyCallStack)
 import Network.HTTP.Req
+import Numeric.Natural (Natural)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 
@@ -171,18 +184,57 @@ data ClonadError
       { parseSpec :: Text,
         parseRaw :: Text,
         parseError :: Text,
-        parseExpectedType :: Text
+        parseExpectedType :: Text,
+        parseCallStack :: CallStack
       }
   | -- | API request failed
     ClonadApiError
       { apiMessage :: Text,
-        apiBackend :: Text
+        apiBackend :: Text,
+        apiCallStack :: CallStack
       }
   | -- | Configuration error (missing env vars, invalid values)
     ClonadConfigError
-      { configMessage :: Text
+      { configMessage :: Text,
+        configCallStack :: CallStack
       }
-  deriving stock (Show, Eq)
+
+instance Show ClonadError where
+  show (ClonadParseError spec raw err expected cs) =
+    "ClonadParseError {parseSpec = "
+      <> show spec
+      <> ", parseRaw = "
+      <> show raw
+      <> ", parseError = "
+      <> show err
+      <> ", parseExpectedType = "
+      <> show expected
+      <> ", parseCallStack = "
+      <> prettyCallStack cs
+      <> "}"
+  show (ClonadApiError msg backend cs) =
+    "ClonadApiError {apiMessage = "
+      <> show msg
+      <> ", apiBackend = "
+      <> show backend
+      <> ", apiCallStack = "
+      <> prettyCallStack cs
+      <> "}"
+  show (ClonadConfigError msg cs) =
+    "ClonadConfigError {configMessage = "
+      <> show msg
+      <> ", configCallStack = "
+      <> prettyCallStack cs
+      <> "}"
+
+instance Eq ClonadError where
+  ClonadParseError s1 r1 e1 t1 _ == ClonadParseError s2 r2 e2 t2 _ =
+    s1 == s2 && r1 == r2 && e1 == e2 && t1 == t2
+  ClonadApiError m1 b1 _ == ClonadApiError m2 b2 _ =
+    m1 == m2 && b1 == b2
+  ClonadConfigError m1 _ == ClonadConfigError m2 _ =
+    m1 == m2
+  _ == _ = False
 
 instance Exception ClonadError
 
@@ -223,6 +275,28 @@ instance ClonadParam Double where serialise = T.pack . show
 
 instance ClonadParam Bool where serialise = T.pack . show
 
+instance ClonadParam Float where serialise = T.pack . show
+
+instance ClonadParam Word where serialise = T.pack . show
+
+instance ClonadParam Word8 where serialise = T.pack . show
+
+instance ClonadParam Word16 where serialise = T.pack . show
+
+instance ClonadParam Word32 where serialise = T.pack . show
+
+instance ClonadParam Word64 where serialise = T.pack . show
+
+instance ClonadParam Int8 where serialise = T.pack . show
+
+instance ClonadParam Int16 where serialise = T.pack . show
+
+instance ClonadParam Int32 where serialise = T.pack . show
+
+instance ClonadParam Int64 where serialise = T.pack . show
+
+instance ClonadParam Natural where serialise = T.pack . show
+
 instance ClonadParam () where serialise = const "()"
 
 instance (ClonadParam a) => ClonadParam [a] where
@@ -230,6 +304,27 @@ instance (ClonadParam a) => ClonadParam [a] where
 
 instance (ClonadParam a, ClonadParam b) => ClonadParam (a, b) where
   serialise (a, b) = "(" <> serialise a <> ", " <> serialise b <> ")"
+
+instance (ClonadParam a, ClonadParam b, ClonadParam c) => ClonadParam (a, b, c) where
+  serialise (a, b, c) = "(" <> serialise a <> ", " <> serialise b <> ", " <> serialise c <> ")"
+
+instance (ClonadParam a, ClonadParam b, ClonadParam c, ClonadParam d) => ClonadParam (a, b, c, d) where
+  serialise (a, b, c, d) = "(" <> serialise a <> ", " <> serialise b <> ", " <> serialise c <> ", " <> serialise d <> ")"
+
+instance (ClonadParam a, ClonadParam b, ClonadParam c, ClonadParam d, ClonadParam e) => ClonadParam (a, b, c, d, e) where
+  serialise (a, b, c, d, e) = "(" <> serialise a <> ", " <> serialise b <> ", " <> serialise c <> ", " <> serialise d <> ", " <> serialise e <> ")"
+
+instance (ClonadParam a) => ClonadParam (NonEmpty a) where
+  serialise = T.intercalate "\n" . map serialise . NE.toList
+
+instance (ClonadParam a) => ClonadParam (Set a) where
+  serialise = T.intercalate "\n" . map serialise . Set.toList
+
+instance (ClonadParam k, ClonadParam v) => ClonadParam (Map k v) where
+  serialise m = T.intercalate "\n" [serialise k <> ": " <> serialise v | (k, v) <- Map.toList m]
+
+instance (ClonadParam a) => ClonadParam (Vector a) where
+  serialise = T.intercalate "\n" . map serialise . V.toList
 
 -- ---------------------------------------------------------------------------
 -- ClonadReturn instances
@@ -262,6 +357,50 @@ instance ClonadReturn Bool where
     "false" -> Right False
     other -> Left $ "Not a Bool: " <> other
 
+instance ClonadReturn Float where
+  returnSpec _ = "Return ONLY a number. No text, no explanation."
+  deserialise = parseWith @Float "Float"
+
+instance ClonadReturn Word where
+  returnSpec _ = "Return ONLY a non-negative integer. No text, no explanation."
+  deserialise = parseWith @Word "Word"
+
+instance ClonadReturn Word8 where
+  returnSpec _ = "Return ONLY an integer from 0 to 255. No text, no explanation."
+  deserialise = parseWith @Word8 "Word8"
+
+instance ClonadReturn Word16 where
+  returnSpec _ = "Return ONLY a non-negative integer. No text, no explanation."
+  deserialise = parseWith @Word16 "Word16"
+
+instance ClonadReturn Word32 where
+  returnSpec _ = "Return ONLY a non-negative integer. No text, no explanation."
+  deserialise = parseWith @Word32 "Word32"
+
+instance ClonadReturn Word64 where
+  returnSpec _ = "Return ONLY a non-negative integer. No text, no explanation."
+  deserialise = parseWith @Word64 "Word64"
+
+instance ClonadReturn Int8 where
+  returnSpec _ = "Return ONLY an integer from -128 to 127. No text, no explanation."
+  deserialise = parseWith @Int8 "Int8"
+
+instance ClonadReturn Int16 where
+  returnSpec _ = "Return ONLY an integer. No text, no explanation."
+  deserialise = parseWith @Int16 "Int16"
+
+instance ClonadReturn Int32 where
+  returnSpec _ = "Return ONLY an integer. No text, no explanation."
+  deserialise = parseWith @Int32 "Int32"
+
+instance ClonadReturn Int64 where
+  returnSpec _ = "Return ONLY an integer. No text, no explanation."
+  deserialise = parseWith @Int64 "Int64"
+
+instance ClonadReturn Natural where
+  returnSpec _ = "Return ONLY a non-negative integer. No text, no explanation."
+  deserialise = parseWith @Natural "Natural"
+
 instance ClonadReturn () where
   returnSpec _ = "Do not return any value."
   deserialise = const (Right ())
@@ -278,12 +417,51 @@ instance (FromJSON a) => ClonadReturn [a] where
   returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
   deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
 
+instance (FromJSON a) => ClonadReturn (NonEmpty a) where
+  returnSpec _ = "Return ONLY a non-empty JSON array. No markdown, no code fences, no explanation."
+  deserialise t = do
+    xs <- first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t
+    maybe (Left "Expected non-empty array") Right $ NE.nonEmpty xs
+
+instance (Ord a, FromJSON a) => ClonadReturn (Set a) where
+  returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
+  deserialise t = Set.fromList <$> (first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t)
+
+instance (Ord k, Aeson.FromJSONKey k, FromJSON v) => ClonadReturn (Map k v) where
+  returnSpec _ = "Return ONLY a JSON object. No markdown, no code fences, no explanation."
+  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+
+instance (FromJSON a) => ClonadReturn (Vector a) where
+  returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
+  deserialise t = V.fromList <$> (first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t)
+
 instance (FromJSON a, FromJSON b) => ClonadReturn (a, b) where
   returnSpec _ = "Return ONLY a JSON array of exactly two elements. No markdown, no explanation."
   deserialise t =
     first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
       [a, b] -> first T.pack $ (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
       _ -> Left "Expected a two-element array"
+
+instance (FromJSON a, FromJSON b, FromJSON c) => ClonadReturn (a, b, c) where
+  returnSpec _ = "Return ONLY a JSON array of exactly three elements. No markdown, no explanation."
+  deserialise t =
+    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+      [a, b, c] -> first T.pack $ (,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c
+      _ -> Left "Expected a three-element array"
+
+instance (FromJSON a, FromJSON b, FromJSON c, FromJSON d) => ClonadReturn (a, b, c, d) where
+  returnSpec _ = "Return ONLY a JSON array of exactly four elements. No markdown, no explanation."
+  deserialise t =
+    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+      [a, b, c, d] -> first T.pack $ (,,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c <*> parseEither parseJSON d
+      _ -> Left "Expected a four-element array"
+
+instance (FromJSON a, FromJSON b, FromJSON c, FromJSON d, FromJSON e) => ClonadReturn (a, b, c, d, e) where
+  returnSpec _ = "Return ONLY a JSON array of exactly five elements. No markdown, no explanation."
+  deserialise t =
+    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+      [a, b, c, d, e] -> first T.pack $ (,,,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c <*> parseEither parseJSON d <*> parseEither parseJSON e
+      _ -> Left "Expected a five-element array"
 
 instance (ClonadReturn a, ClonadReturn b) => ClonadReturn (Either a b) where
   returnSpec _ =
@@ -386,7 +564,7 @@ data ClonadEnv = ClonadEnv
 -- | Read environment variables and construct a 'ClonadEnv'.
 -- Checks @OLLAMA_HOST@ first (for local Ollama), then @OPENAI_API_KEY@, then @ANTHROPIC_API_KEY@.
 -- Throws 'ClonadConfigError' if no valid configuration is found.
-defaultEnv :: IO ClonadEnv
+defaultEnv :: (HasCallStack) => IO ClonadEnv
 defaultEnv = do
   mOllama <- lookupEnv "OLLAMA_HOST"
   mModel <- lookupEnv "CLONAD_MODEL"
@@ -400,17 +578,21 @@ defaultEnv = do
         Just key ->
           let modelId = maybe (ModelId "gpt-4o-mini") (ModelId . T.pack) mModel
            in case mkApiKey (T.pack key) of
-                Nothing -> throwIO $ ClonadConfigError "OPENAI_API_KEY is empty"
+                Nothing -> throwClonadConfigError "OPENAI_API_KEY is empty"
                 Just apiKey -> pure $ mkOpenAIEnv apiKey modelId (T.pack <$> mOpenAIBase)
         Nothing ->
           lookupEnv "ANTHROPIC_API_KEY" >>= \case
             Nothing ->
-              throwIO $
-                ClonadConfigError
-                  "none of OLLAMA_HOST, OPENAI_API_KEY, or ANTHROPIC_API_KEY set"
+              throwClonadConfigError
+                "none of OLLAMA_HOST, OPENAI_API_KEY, or ANTHROPIC_API_KEY set"
             Just key -> case mkApiKey (T.pack key) of
-              Nothing -> throwIO $ ClonadConfigError "ANTHROPIC_API_KEY is empty"
+              Nothing -> throwClonadConfigError "ANTHROPIC_API_KEY is empty"
               Just apiKey -> pure $ mkEnv apiKey
+
+-- | Throw a ClonadConfigError with the current call stack.
+throwClonadConfigError :: (HasCallStack) => Text -> IO a
+throwClonadConfigError msg =
+  throwIO $ ClonadConfigError {configMessage = msg, configCallStack = callStack}
 
 -- | Construct a 'ClonadEnv' for Anthropic.
 mkEnv :: ApiKey -> ClonadEnv
@@ -454,6 +636,10 @@ mkOpenAIEnv key modelId mBaseUrl =
 runClonad :: ClonadEnv -> Clonad a -> IO a
 runClonad env (Clonad m) = runReaderT m env
 
+-- | Run a 'Clonad' computation, catching 'ClonadError' exceptions.
+runClonadEither :: ClonadEnv -> Clonad a -> IO (Either ClonadError a)
+runClonadEither env action = try @ClonadError $ runClonad env action
+
 -- ---------------------------------------------------------------------------
 -- The Claude FFI
 -- ---------------------------------------------------------------------------
@@ -474,7 +660,7 @@ runClonad env (Clonad m) = runReaderT m env
 -- isSpam :: Text -> Clonad Bool
 -- isSpam = clonad "is this email spam?"
 -- @
-clonad :: forall a b. (ClonadParam a, ClonadReturn b, Typeable b) => Text -> a -> Clonad b
+clonad :: forall a b. (ClonadParam a, ClonadReturn b, Typeable b, HasCallStack) => Text -> a -> Clonad b
 clonad = clonadImpl
 
 -- | Like 'clonad' but takes no input. Useful for generation tasks.
@@ -483,13 +669,36 @@ clonad = clonadImpl
 -- poem :: Clonad Text
 -- poem = clonad_ "write a haiku about Haskell"
 -- @
-clonad_ :: forall b. (ClonadReturn b, Typeable b) => Text -> Clonad b
+clonad_ :: forall b. (ClonadReturn b, Typeable b, HasCallStack) => Text -> Clonad b
 clonad_ spec = clonadImpl spec ()
+
+-- | Like 'clonad' but returns 'Either' instead of throwing.
+--
+-- @
+-- sentiment :: Text -> Clonad (Either ClonadError Double)
+-- sentiment = tryClonad "return a sentiment score from -1.0 to 1.0"
+-- @
+tryClonad ::
+  forall a b.
+  (ClonadParam a, ClonadReturn b, Typeable b, HasCallStack) =>
+  Text ->
+  a ->
+  Clonad (Either ClonadError b)
+tryClonad spec input = Clonad $ ReaderT $ \env ->
+  try @ClonadError $ runClonad env (clonadImpl spec input)
+
+-- | Like 'clonad_' but returns 'Either' instead of throwing.
+tryClonad_ ::
+  forall b.
+  (ClonadReturn b, Typeable b, HasCallStack) =>
+  Text ->
+  Clonad (Either ClonadError b)
+tryClonad_ spec = tryClonad spec ()
 
 -- | Internal implementation of the Claude FFI.
 clonadImpl ::
   forall a b.
-  (ClonadParam a, ClonadReturn b, Typeable b) =>
+  (ClonadParam a, ClonadReturn b, Typeable b, HasCallStack) =>
   Text ->
   a ->
   Clonad b
@@ -522,7 +731,8 @@ clonadImpl spec input = do
           { parseSpec = spec,
             parseRaw = rawText,
             parseError = err,
-            parseExpectedType = T.pack $ show (typeRep (Proxy @b))
+            parseExpectedType = T.pack $ show (typeRep (Proxy @b)),
+            parseCallStack = callStack
           }
     Right val -> pure val
 
@@ -609,6 +819,14 @@ parseBaseUrl baseUrl defaultPort = do
 -- Backend Implementations
 -- ---------------------------------------------------------------------------
 
+-- | Standard JSON content-type header.
+jsonContentType :: Option scheme
+jsonContentType = header "content-type" "application/json"
+
+-- | Bearer token authentication header.
+bearerAuth :: ApiKey -> Option scheme
+bearerAuth key = header "Authorization" ("Bearer " <> TE.encodeUtf8 (unApiKey key))
+
 -- | Build chat messages for OpenAI-compatible APIs.
 buildChatMessages :: Text -> Text -> [Aeson.Value]
 buildChatMessages systemMsg userMsg =
@@ -623,8 +841,28 @@ buildChatBody modelId messages mTemp =
     ["model" .= unModelId modelId, "messages" .= messages]
       <> ["temperature" .= unTemperature t | Just t <- [mTemp]]
 
+-- | Call OpenAI-compatible chat completion endpoint with scheme dispatch.
+-- Headers are provided per-scheme to handle type differences.
+callChatCompletion ::
+  ParsedUrl ->
+  Option 'Https ->
+  Option 'Http ->
+  ClonadEnv ->
+  Text ->
+  Text ->
+  IO Text
+callChatCompletion parsed httpsHeaders httpHeaders env systemMsg userMsg = runReq defaultHttpConfig do
+  let messages = buildChatMessages systemMsg userMsg
+      body = buildChatBody env.model messages env.temperature
+  resp <- case parsed.scheme of
+    UrlHttps ->
+      req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (httpsHeaders <> jsonContentType)
+    UrlHttp ->
+      req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (httpHeaders <> jsonContentType <> port parsed.portNum)
+  pure $ extractChatContent (responseBody resp)
+
 -- | Call the LLM backend, wrapping HTTP exceptions in ClonadApiError.
-callLLM :: ClonadEnv -> Text -> Text -> IO Text
+callLLM :: (HasCallStack) => ClonadEnv -> Text -> Text -> IO Text
 callLLM env systemMsg userMsg = do
   let backendName = case env.backend of
         Anthropic {} -> "Anthropic"
@@ -635,7 +873,13 @@ callLLM env systemMsg userMsg = do
     Ollama base -> callOllama env base systemMsg userMsg
     OpenAI key mBase -> callOpenAI env key mBase systemMsg userMsg
   case result of
-    Left err -> throwIO $ ClonadApiError {apiMessage = T.pack $ show err, apiBackend = backendName}
+    Left err ->
+      throwIO $
+        ClonadApiError
+          { apiMessage = T.pack $ show err,
+            apiBackend = backendName,
+            apiCallStack = callStack
+          }
     Right txt -> pure txt
 
 callAnthropic :: ClonadEnv -> ApiKey -> Text -> Text -> IO Text
@@ -644,7 +888,7 @@ callAnthropic env apiKey systemMsg userMsg = runReq defaultHttpConfig do
       headers =
         header "x-api-key" (TE.encodeUtf8 $ unApiKey apiKey)
           <> header "anthropic-version" "2023-06-01"
-          <> header "content-type" "application/json"
+          <> jsonContentType
       body =
         object $
           [ "model" .= unModelId env.model,
@@ -657,46 +901,22 @@ callAnthropic env apiKey systemMsg userMsg = runReq defaultHttpConfig do
   let ApiResponse contentBlocks = responseBody resp
   pure $ T.intercalate "\n" [blk.blockText | blk <- NE.toList contentBlocks, blk.blockType == "text"]
 
-callOllama :: ClonadEnv -> Text -> Text -> Text -> IO Text
+callOllama :: (HasCallStack) => ClonadEnv -> Text -> Text -> Text -> IO Text
 callOllama env baseUrl systemMsg userMsg = do
-  parsed <- case parseBaseUrl baseUrl 11434 of
-    Left err -> throwIO $ ClonadApiError {apiMessage = err, apiBackend = "Ollama"}
-    Right p -> pure p
-  runReq defaultHttpConfig do
-    let messages = buildChatMessages systemMsg userMsg
-        body = buildChatBody env.model messages env.temperature
-        headers = header "content-type" "application/json"
-    resp <- case parsed.scheme of
-      UrlHttps ->
-        req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
-      UrlHttp ->
-        req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
-    pure $ extractChatContent (responseBody resp)
+  parsed <- either (throwClonadApiError "Ollama") pure $ parseBaseUrl baseUrl 11434
+  callChatCompletion parsed mempty mempty env systemMsg userMsg
 
-callOpenAI :: ClonadEnv -> ApiKey -> Maybe Text -> Text -> Text -> IO Text
+callOpenAI :: (HasCallStack) => ClonadEnv -> ApiKey -> Maybe Text -> Text -> Text -> IO Text
 callOpenAI env apiKey mBaseUrl systemMsg userMsg = do
-  mParsed <- case mBaseUrl of
-    Nothing -> pure Nothing
-    Just baseUrl -> case parseBaseUrl baseUrl 443 of
-      Left err -> throwIO $ ClonadApiError {apiMessage = err, apiBackend = "OpenAI"}
-      Right p -> pure $ Just p
-  runReq defaultHttpConfig do
-    let messages = buildChatMessages systemMsg userMsg
-        body = buildChatBody env.model messages env.temperature
-        authHeader = header "Authorization" ("Bearer " <> TE.encodeUtf8 (unApiKey apiKey))
-        headers = authHeader <> header "content-type" "application/json"
-    resp <- case mParsed of
-      Nothing ->
-        -- Default OpenAI endpoint
-        req POST (https "api.openai.com" /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
-      Just parsed ->
-        -- Custom OpenAI-compatible endpoint
-        case parsed.scheme of
-          UrlHttps ->
-            req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
-          UrlHttp ->
-            req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
-    pure $ extractChatContent (responseBody resp)
+  parsed <- case mBaseUrl of
+    Nothing -> pure ParsedUrl {scheme = UrlHttps, host = "api.openai.com", portNum = 443}
+    Just url -> either (throwClonadApiError "OpenAI") pure $ parseBaseUrl url 443
+  callChatCompletion parsed (bearerAuth apiKey) (bearerAuth apiKey) env systemMsg userMsg
+
+-- | Throw a ClonadApiError with the current call stack.
+throwClonadApiError :: (HasCallStack) => Text -> Text -> IO a
+throwClonadApiError backend msg =
+  throwIO $ ClonadApiError {apiMessage = msg, apiBackend = backend, apiCallStack = callStack}
 
 -- | Extract text content from a chat completion response.
 extractChatContent :: ChatResponse -> Text
