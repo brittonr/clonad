@@ -5,6 +5,7 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -66,6 +67,8 @@ module Clonad
     ClonadParam (..),
     ClonadReturn (..),
     AsJSON (..),
+    ViaShow (..),
+    ViaRead (..),
 
     -- * Environment
     defaultEnv,
@@ -94,6 +97,7 @@ import Data.Aeson qualified as Aeson
 import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (parseEither)
 import Data.Bifunctor (first)
+import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LBS
 import Data.Int (Int16, Int32, Int64, Int8)
 import Data.List.NonEmpty (NonEmpty (..))
@@ -201,31 +205,27 @@ data ClonadError
 
 instance Show ClonadError where
   show (ClonadParseError spec raw err expected cs) =
-    "ClonadParseError {parseSpec = "
-      <> show spec
-      <> ", parseRaw = "
-      <> show raw
-      <> ", parseError = "
-      <> show err
-      <> ", parseExpectedType = "
-      <> show expected
-      <> ", parseCallStack = "
-      <> prettyCallStack cs
-      <> "}"
+    unlines
+      [ "ClonadParseError:",
+        "  parseSpec = " <> show spec,
+        "  parseRaw = " <> show (T.take 100 raw) <> if T.length raw > 100 then "..." else "",
+        "  parseError = " <> show err,
+        "  parseExpectedType = " <> show expected,
+        "  parseCallStack = " <> prettyCallStack cs
+      ]
   show (ClonadApiError msg backend cs) =
-    "ClonadApiError {apiMessage = "
-      <> show msg
-      <> ", apiBackend = "
-      <> show backend
-      <> ", apiCallStack = "
-      <> prettyCallStack cs
-      <> "}"
+    unlines
+      [ "ClonadApiError:",
+        "  apiMessage = " <> show msg,
+        "  apiBackend = " <> show backend,
+        "  apiCallStack = " <> prettyCallStack cs
+      ]
   show (ClonadConfigError msg cs) =
-    "ClonadConfigError {configMessage = "
-      <> show msg
-      <> ", configCallStack = "
-      <> prettyCallStack cs
-      <> "}"
+    unlines
+      [ "ClonadConfigError:",
+        "  configMessage = " <> show msg,
+        "  configCallStack = " <> prettyCallStack cs
+      ]
 
 instance Eq ClonadError where
   ClonadParseError s1 r1 e1 t1 _ == ClonadParseError s2 r2 e2 t2 _ =
@@ -257,7 +257,21 @@ class ClonadReturn a where
   returnSpec p = "Return ONLY a valid JSON value of Haskell type: " <> T.pack (show (typeRep p))
 
   default deserialise :: (FromJSON a) => Text -> Either Text a
-  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+  deserialise = parseJsonText
+
+-- ---------------------------------------------------------------------------
+-- Serialisation Helpers
+-- ---------------------------------------------------------------------------
+
+-- | Serialise a Show instance to Text.
+showSerialise :: (Show a) => a -> Text
+showSerialise = T.pack . show
+{-# INLINE showSerialise #-}
+
+-- | Parse JSON from text, stripping code fences.
+parseJsonText :: (FromJSON a) => Text -> Either Text a
+parseJsonText = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+{-# INLINE parseJsonText #-}
 
 -- ---------------------------------------------------------------------------
 -- ClonadParam instances
@@ -267,35 +281,35 @@ instance ClonadParam Text where serialise = id
 
 instance ClonadParam String where serialise = T.pack
 
-instance ClonadParam Int where serialise = T.pack . show
+instance ClonadParam Int where serialise = showSerialise
 
-instance ClonadParam Integer where serialise = T.pack . show
+instance ClonadParam Integer where serialise = showSerialise
 
-instance ClonadParam Double where serialise = T.pack . show
+instance ClonadParam Double where serialise = showSerialise
 
-instance ClonadParam Bool where serialise = T.pack . show
+instance ClonadParam Bool where serialise = showSerialise
 
-instance ClonadParam Float where serialise = T.pack . show
+instance ClonadParam Float where serialise = showSerialise
 
-instance ClonadParam Word where serialise = T.pack . show
+instance ClonadParam Word where serialise = showSerialise
 
-instance ClonadParam Word8 where serialise = T.pack . show
+instance ClonadParam Word8 where serialise = showSerialise
 
-instance ClonadParam Word16 where serialise = T.pack . show
+instance ClonadParam Word16 where serialise = showSerialise
 
-instance ClonadParam Word32 where serialise = T.pack . show
+instance ClonadParam Word32 where serialise = showSerialise
 
-instance ClonadParam Word64 where serialise = T.pack . show
+instance ClonadParam Word64 where serialise = showSerialise
 
-instance ClonadParam Int8 where serialise = T.pack . show
+instance ClonadParam Int8 where serialise = showSerialise
 
-instance ClonadParam Int16 where serialise = T.pack . show
+instance ClonadParam Int16 where serialise = showSerialise
 
-instance ClonadParam Int32 where serialise = T.pack . show
+instance ClonadParam Int32 where serialise = showSerialise
 
-instance ClonadParam Int64 where serialise = T.pack . show
+instance ClonadParam Int64 where serialise = showSerialise
 
-instance ClonadParam Natural where serialise = T.pack . show
+instance ClonadParam Natural where serialise = showSerialise
 
 instance ClonadParam () where serialise = const "()"
 
@@ -415,51 +429,51 @@ instance (ClonadReturn a) => ClonadReturn (Maybe a) where
 
 instance (FromJSON a) => ClonadReturn [a] where
   returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
-  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+  deserialise = parseJsonText
 
 instance (FromJSON a) => ClonadReturn (NonEmpty a) where
   returnSpec _ = "Return ONLY a non-empty JSON array. No markdown, no code fences, no explanation."
   deserialise t = do
-    xs <- first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t
+    xs <- parseJsonText t
     maybe (Left "Expected non-empty array") Right $ NE.nonEmpty xs
 
 instance (Ord a, FromJSON a) => ClonadReturn (Set a) where
   returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
-  deserialise t = Set.fromList <$> (first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t)
+  deserialise t = Set.fromList <$> parseJsonText t
 
 instance (Ord k, Aeson.FromJSONKey k, FromJSON v) => ClonadReturn (Map k v) where
   returnSpec _ = "Return ONLY a JSON object. No markdown, no code fences, no explanation."
-  deserialise = first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences
+  deserialise = parseJsonText
 
 instance (FromJSON a) => ClonadReturn (Vector a) where
   returnSpec _ = "Return ONLY a JSON array. No markdown, no code fences, no explanation."
-  deserialise t = V.fromList <$> (first T.pack . eitherDecodeStrict . TE.encodeUtf8 . stripCodeFences $ t)
+  deserialise t = V.fromList <$> parseJsonText t
 
 instance (FromJSON a, FromJSON b) => ClonadReturn (a, b) where
   returnSpec _ = "Return ONLY a JSON array of exactly two elements. No markdown, no explanation."
   deserialise t =
-    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+    parseJsonText @[Aeson.Value] t >>= \case
       [a, b] -> first T.pack $ (,) <$> parseEither parseJSON a <*> parseEither parseJSON b
       _ -> Left "Expected a two-element array"
 
 instance (FromJSON a, FromJSON b, FromJSON c) => ClonadReturn (a, b, c) where
   returnSpec _ = "Return ONLY a JSON array of exactly three elements. No markdown, no explanation."
   deserialise t =
-    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+    parseJsonText @[Aeson.Value] t >>= \case
       [a, b, c] -> first T.pack $ (,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c
       _ -> Left "Expected a three-element array"
 
 instance (FromJSON a, FromJSON b, FromJSON c, FromJSON d) => ClonadReturn (a, b, c, d) where
   returnSpec _ = "Return ONLY a JSON array of exactly four elements. No markdown, no explanation."
   deserialise t =
-    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+    parseJsonText @[Aeson.Value] t >>= \case
       [a, b, c, d] -> first T.pack $ (,,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c <*> parseEither parseJSON d
       _ -> Left "Expected a four-element array"
 
 instance (FromJSON a, FromJSON b, FromJSON c, FromJSON d, FromJSON e) => ClonadReturn (a, b, c, d, e) where
   returnSpec _ = "Return ONLY a JSON array of exactly five elements. No markdown, no explanation."
   deserialise t =
-    first T.pack (eitherDecodeStrict (TE.encodeUtf8 $ stripCodeFences t)) >>= \case
+    parseJsonText @[Aeson.Value] t >>= \case
       [a, b, c, d, e] -> first T.pack $ (,,,,) <$> parseEither parseJSON a <*> parseEither parseJSON b <*> parseEither parseJSON c <*> parseEither parseJSON d <*> parseEither parseJSON e
       _ -> Left "Expected a five-element array"
 
@@ -467,14 +481,12 @@ instance (ClonadReturn a, ClonadReturn b) => ClonadReturn (Either a b) where
   returnSpec _ =
     "Return ONLY a JSON object with either {\"Left\": <value>} or {\"Right\": <value>}. No explanation."
   deserialise t =
-    let stripped = stripCodeFences t
-     in case first T.pack (eitherDecodeStrict @Aeson.Value (TE.encodeUtf8 stripped)) of
-          Prelude.Left err -> Prelude.Left err
-          Prelude.Right (Aeson.Object obj) -> case (KM.lookup "Left" obj, KM.lookup "Right" obj) of
-            (Just val, Nothing) -> Prelude.Left <$> deserialiseValue val
-            (Nothing, Just val) -> Prelude.Right <$> deserialiseValue val
-            _ -> Prelude.Left "Expected object with exactly one of 'Left' or 'Right' key"
-          Prelude.Right _ -> Prelude.Left "Expected a JSON object"
+    parseJsonText @Aeson.Value t >>= \case
+      Aeson.Object obj -> case (KM.lookup "Left" obj, KM.lookup "Right" obj) of
+        (Just val, Nothing) -> Prelude.Left <$> deserialiseValue val
+        (Nothing, Just val) -> Prelude.Right <$> deserialiseValue val
+        _ -> Prelude.Left "Expected object with exactly one of 'Left' or 'Right' key"
+      _ -> Prelude.Left "Expected a JSON object"
     where
       deserialiseValue :: (ClonadReturn c) => Aeson.Value -> Either Text c
       deserialiseValue v = deserialise (TE.decodeUtf8 . LBS.toStrict $ Aeson.encode v)
@@ -501,6 +513,33 @@ newtype AsJSON a = AsJSON {unAsJSON :: a}
 
 instance (Aeson.ToJSON a) => ClonadParam (AsJSON a) where
   serialise (AsJSON x) = TE.decodeUtf8 . LBS.toStrict $ Aeson.encode x
+
+-- | Newtype wrapper for deriving 'ClonadParam' via Show.
+--
+-- @
+-- newtype UserId = UserId Int
+--   deriving stock (Show)
+--   deriving ClonadParam via (ViaShow UserId)
+-- @
+newtype ViaShow a = ViaShow {unViaShow :: a}
+
+instance (Show a) => ClonadParam (ViaShow a) where
+  serialise (ViaShow x) = T.pack (show x)
+
+-- | Newtype wrapper for deriving 'ClonadReturn' via Read.
+--
+-- @
+-- newtype UserId = UserId Int
+--   deriving stock (Read, Typeable)
+--   deriving ClonadReturn via (ViaRead UserId)
+-- @
+newtype ViaRead a = ViaRead {unViaRead :: a}
+
+instance (Read a, Typeable a) => ClonadReturn (ViaRead a) where
+  returnSpec p = "Return ONLY a valid Haskell value of type: " <> T.pack (show (typeRep p))
+  deserialise t =
+    maybe (Left $ "Parse failed: " <> t) (Right . ViaRead) $
+      readMaybe (T.unpack $ T.strip t)
 
 -- ---------------------------------------------------------------------------
 -- The Clonad Monad
@@ -546,6 +585,12 @@ instance Show Backend where
   show (Anthropic _) = "Anthropic <key>"
   show (Ollama url) = "Ollama " <> show url
   show (OpenAI _ mUrl) = "OpenAI <key> " <> show mUrl
+
+-- | Get display name for a backend (used in error messages).
+backendName :: Backend -> Text
+backendName (Anthropic {}) = "Anthropic"
+backendName (Ollama {}) = "Ollama"
+backendName (OpenAI {}) = "OpenAI"
 
 -- | The execution environment.
 data ClonadEnv = ClonadEnv
@@ -794,6 +839,31 @@ data ParsedUrl = ParsedUrl
 data UrlScheme = UrlHttp | UrlHttps
   deriving stock (Eq)
 
+-- | A URL ready for req, abstracting over scheme.
+data ReqUrl where
+  ReqUrlHttps :: Url 'Https -> ReqUrl
+  ReqUrlHttp :: Url 'Http -> Int -> ReqUrl
+
+-- | Build URL from parsed components and path segments.
+buildReqUrl :: ParsedUrl -> [Text] -> ReqUrl
+buildReqUrl parsed segments =
+  let addPath url [] = url
+      addPath url (p : ps) = addPath (url /: p) ps
+   in case parsed.scheme of
+        UrlHttps -> ReqUrlHttps (addPath (https parsed.host) segments)
+        UrlHttp -> ReqUrlHttp (addPath (http parsed.host) segments) parsed.portNum
+
+-- | Execute POST with JSON body, dispatching on scheme.
+runJsonPost ::
+  ReqUrl ->
+  Aeson.Value ->
+  Option 'Https ->
+  Option 'Http ->
+  IO LBS.ByteString
+runJsonPost url body httpsOpts httpOpts = runReq defaultHttpConfig $ case url of
+  ReqUrlHttps u -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse httpsOpts
+  ReqUrlHttp u p -> responseBody <$> req POST u (ReqBodyJson body) lbsResponse (httpOpts <> port p)
+
 -- | Parse a base URL into its components.
 -- Returns Left with an error message if the URL is invalid.
 parseBaseUrl :: Text -> Int -> Either Text ParsedUrl
@@ -814,6 +884,28 @@ parseBaseUrl baseUrl defaultPort = do
         host = hostText,
         portNum = parsedPort
       }
+
+-- ---------------------------------------------------------------------------
+-- API Constants
+-- ---------------------------------------------------------------------------
+
+anthropicHost :: Text
+anthropicHost = "api.anthropic.com"
+
+openaiHost :: Text
+openaiHost = "api.openai.com"
+
+chatCompletionsPath :: [Text]
+chatCompletionsPath = ["v1", "chat", "completions"]
+
+anthropicVersionHeader :: ByteString
+anthropicVersionHeader = "2023-06-01"
+
+ollamaDefaultPort :: Int
+ollamaDefaultPort = 11434
+
+httpsDefaultPort :: Int
+httpsDefaultPort = 443
 
 -- ---------------------------------------------------------------------------
 -- Backend Implementations
@@ -851,23 +943,19 @@ callChatCompletion ::
   Text ->
   Text ->
   IO Text
-callChatCompletion parsed httpsHeaders httpHeaders env systemMsg userMsg = runReq defaultHttpConfig do
+callChatCompletion parsed httpsHeaders httpHeaders env systemMsg userMsg = do
   let messages = buildChatMessages systemMsg userMsg
       body = buildChatBody env.model messages env.temperature
-  resp <- case parsed.scheme of
-    UrlHttps ->
-      req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (httpsHeaders <> jsonContentType)
-    UrlHttp ->
-      req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (httpHeaders <> jsonContentType <> port parsed.portNum)
-  pure $ extractChatContent (responseBody resp)
+      url = buildReqUrl parsed chatCompletionsPath
+  respBytes <- runJsonPost url body (httpsHeaders <> jsonContentType) (httpHeaders <> jsonContentType)
+  case eitherDecodeStrict (LBS.toStrict respBytes) of
+    Left err -> fail $ "Failed to parse chat response: " <> err
+    Right resp -> pure $ extractChatContent resp
 
 -- | Call the LLM backend, wrapping HTTP exceptions in ClonadApiError.
 callLLM :: (HasCallStack) => ClonadEnv -> Text -> Text -> IO Text
 callLLM env systemMsg userMsg = do
-  let backendName = case env.backend of
-        Anthropic {} -> "Anthropic"
-        Ollama {} -> "Ollama"
-        OpenAI {} -> "OpenAI"
+  let backend = backendName env.backend
   result <- try @SomeException $ case env.backend of
     Anthropic key -> callAnthropic env key systemMsg userMsg
     Ollama base -> callOllama env base systemMsg userMsg
@@ -877,17 +965,17 @@ callLLM env systemMsg userMsg = do
       throwIO $
         ClonadApiError
           { apiMessage = T.pack $ show err,
-            apiBackend = backendName,
+            apiBackend = backend,
             apiCallStack = callStack
           }
     Right txt -> pure txt
 
 callAnthropic :: ClonadEnv -> ApiKey -> Text -> Text -> IO Text
 callAnthropic env apiKey systemMsg userMsg = runReq defaultHttpConfig do
-  let url = https "api.anthropic.com" /: "v1" /: "messages"
+  let url = https anthropicHost /: "v1" /: "messages"
       headers =
         header "x-api-key" (TE.encodeUtf8 $ unApiKey apiKey)
-          <> header "anthropic-version" "2023-06-01"
+          <> header "anthropic-version" anthropicVersionHeader
           <> jsonContentType
       body =
         object $
@@ -903,14 +991,14 @@ callAnthropic env apiKey systemMsg userMsg = runReq defaultHttpConfig do
 
 callOllama :: (HasCallStack) => ClonadEnv -> Text -> Text -> Text -> IO Text
 callOllama env baseUrl systemMsg userMsg = do
-  parsed <- either (throwClonadApiError "Ollama") pure $ parseBaseUrl baseUrl 11434
+  parsed <- either (throwClonadApiError "Ollama") pure $ parseBaseUrl baseUrl ollamaDefaultPort
   callChatCompletion parsed mempty mempty env systemMsg userMsg
 
 callOpenAI :: (HasCallStack) => ClonadEnv -> ApiKey -> Maybe Text -> Text -> Text -> IO Text
 callOpenAI env apiKey mBaseUrl systemMsg userMsg = do
   parsed <- case mBaseUrl of
-    Nothing -> pure ParsedUrl {scheme = UrlHttps, host = "api.openai.com", portNum = 443}
-    Just url -> either (throwClonadApiError "OpenAI") pure $ parseBaseUrl url 443
+    Nothing -> pure ParsedUrl {scheme = UrlHttps, host = openaiHost, portNum = httpsDefaultPort}
+    Just url -> either (throwClonadApiError "OpenAI") pure $ parseBaseUrl url httpsDefaultPort
   callChatCompletion parsed (bearerAuth apiKey) (bearerAuth apiKey) env systemMsg userMsg
 
 -- | Throw a ClonadApiError with the current call stack.
