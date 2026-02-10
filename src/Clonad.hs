@@ -1,9 +1,13 @@
 {-# LANGUAGE GHC2021 #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StrictData #-}
+{-# LANGUAGE NoFieldSelectors #-}
 
 -- |
 -- Module      : Clonad
@@ -35,6 +39,20 @@ module Clonad
     ClonadEnv (..),
     Backend (..),
 
+    -- * Errors
+    ClonadError (..),
+
+    -- * Domain Types
+    ApiKey,
+    mkApiKey,
+    unApiKey,
+    ModelId,
+    mkModelId,
+    unModelId,
+    Temperature,
+    mkTemperature,
+    unTemperature,
+
     -- * The Claude FFI
     clonad,
     clonad_,
@@ -60,13 +78,16 @@ module Clonad
   )
 where
 
-import Control.Monad.IO.Class (MonadIO)
-import Control.Monad.Reader (MonadReader, ReaderT (..), local)
+import Control.Exception (Exception, throwIO)
+import Control.Monad.Catch (MonadCatch, MonadThrow, throwM)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Reader (MonadReader, ReaderT (..), ask, local)
 import Data.Aeson (FromJSON (..), eitherDecodeStrict, object, (.:), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types (parseEither)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Proxy (Proxy (..))
+import Data.String (IsString (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -74,6 +95,82 @@ import Data.Typeable (Typeable, typeRep)
 import Network.HTTP.Req
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
+
+-- ---------------------------------------------------------------------------
+-- Domain Types (Newtypes for Type Safety)
+-- ---------------------------------------------------------------------------
+
+-- | An API key for authentication with LLM providers.
+newtype ApiKey = ApiKey Text
+  deriving stock (Eq)
+  deriving newtype (IsString)
+
+-- | Smart constructor for ApiKey. Returns Nothing for empty keys.
+mkApiKey :: Text -> Maybe ApiKey
+mkApiKey t
+  | T.null (T.strip t) = Nothing
+  | otherwise = Just (ApiKey t)
+
+-- | Extract the raw text from an ApiKey.
+unApiKey :: ApiKey -> Text
+unApiKey (ApiKey t) = t
+
+instance Show ApiKey where
+  show _ = "ApiKey \"<redacted>\""
+
+-- | A model identifier (e.g., "claude-sonnet-4-20250514", "gpt-4o").
+newtype ModelId = ModelId Text
+  deriving stock (Eq)
+  deriving newtype (Show, IsString)
+
+-- | Smart constructor for ModelId. Returns Nothing for empty model names.
+mkModelId :: Text -> Maybe ModelId
+mkModelId t
+  | T.null (T.strip t) = Nothing
+  | otherwise = Just (ModelId t)
+
+-- | Extract the raw text from a ModelId.
+unModelId :: ModelId -> Text
+unModelId (ModelId t) = t
+
+-- | A temperature value for LLM sampling (typically 0.0 to 2.0).
+newtype Temperature = Temperature Double
+  deriving stock (Eq)
+  deriving newtype (Show, Num, Fractional, Ord)
+
+-- | Smart constructor for Temperature. Returns Nothing for out-of-range values.
+mkTemperature :: Double -> Maybe Temperature
+mkTemperature t
+  | t < 0.0 || t > 2.0 = Nothing
+  | otherwise = Just (Temperature t)
+
+-- | Extract the raw Double from a Temperature.
+unTemperature :: Temperature -> Double
+unTemperature (Temperature t) = t
+
+-- ---------------------------------------------------------------------------
+-- Errors
+-- ---------------------------------------------------------------------------
+
+-- | Errors that can occur during Clonad operations.
+data ClonadError
+  = -- | Failed to parse the LLM response into the expected type
+    ClonadParseError
+      { parseSpec :: Text,
+        parseRaw :: Text,
+        parseError :: String
+      }
+  | -- | API request failed
+    ClonadApiError
+      { apiMessage :: Text
+      }
+  | -- | Configuration error (missing env vars, invalid values)
+    ClonadConfigError
+      { configMessage :: Text
+      }
+  deriving stock (Show, Eq)
+
+instance Exception ClonadError
 
 -- ---------------------------------------------------------------------------
 -- Serialisation Typeclasses
@@ -181,8 +278,16 @@ parseWith typeName t =
 -- Under the hood this is @ReaderT ClonadEnv IO@. Each 'clonad' call
 -- within a pipeline makes a real API request where Claude computes the
 -- result described by your natural-language specification.
-newtype Clonad a = Clonad {unClonad :: ReaderT ClonadEnv IO a}
-  deriving newtype (Functor, Applicative, Monad, MonadIO, MonadReader ClonadEnv)
+newtype Clonad a = Clonad (ReaderT ClonadEnv IO a)
+  deriving newtype
+    ( Functor,
+      Applicative,
+      Monad,
+      MonadIO,
+      MonadReader ClonadEnv,
+      MonadThrow,
+      MonadCatch
+    )
 
 -- | Backend selection for the API
 data Backend
@@ -198,12 +303,12 @@ data Backend
 
 -- | The execution environment.
 data ClonadEnv = ClonadEnv
-  { envBackend :: !Backend,
-    envApiKey :: !Text,
-    envModel :: !Text,
-    envTemperature :: !(Maybe Double),
-    envMaxTokens :: !Int,
-    envSystemPrompt :: !(Maybe Text)
+  { backend :: Backend,
+    apiKey :: ApiKey,
+    model :: ModelId,
+    temperature :: Maybe Temperature,
+    maxTokens :: Int,
+    systemPrompt :: Maybe Text
   }
   deriving stock (Show)
 
@@ -213,55 +318,67 @@ data ClonadEnv = ClonadEnv
 
 -- | Read environment variables and construct a 'ClonadEnv'.
 -- Checks @OLLAMA_HOST@ first (for local Ollama), then @OPENAI_API_KEY@, then @ANTHROPIC_API_KEY@.
+-- Throws 'ClonadConfigError' if no valid configuration is found.
 defaultEnv :: IO ClonadEnv
 defaultEnv = do
   mOllama <- lookupEnv "OLLAMA_HOST"
   mModel <- lookupEnv "CLONAD_MODEL"
   mOpenAIBase <- lookupEnv "OPENAI_BASE_URL"
   case mOllama of
-    Just url -> pure $ mkOllamaEnv (T.pack url) (maybe "qwen2.5:0.5b" T.pack mModel)
+    Just url ->
+      let modelId = maybe (ModelId "qwen2.5:0.5b") (ModelId . T.pack) mModel
+       in pure $ mkOllamaEnv (T.pack url) modelId
     Nothing ->
       lookupEnv "OPENAI_API_KEY" >>= \case
-        Just key -> pure $ mkOpenAIEnv (T.pack key) (maybe "gpt-4o-mini" T.pack mModel) (T.pack <$> mOpenAIBase)
+        Just key ->
+          let modelId = maybe (ModelId "gpt-4o-mini") (ModelId . T.pack) mModel
+           in case mkApiKey (T.pack key) of
+                Nothing -> throwIO $ ClonadConfigError "OPENAI_API_KEY is empty"
+                Just apiKey -> pure $ mkOpenAIEnv apiKey modelId (T.pack <$> mOpenAIBase)
         Nothing ->
           lookupEnv "ANTHROPIC_API_KEY" >>= \case
-            Nothing -> error "Clonad: none of OLLAMA_HOST, OPENAI_API_KEY, or ANTHROPIC_API_KEY set"
-            Just key -> pure $ mkEnv (T.pack key)
+            Nothing ->
+              throwIO $
+                ClonadConfigError
+                  "none of OLLAMA_HOST, OPENAI_API_KEY, or ANTHROPIC_API_KEY set"
+            Just key -> case mkApiKey (T.pack key) of
+              Nothing -> throwIO $ ClonadConfigError "ANTHROPIC_API_KEY is empty"
+              Just apiKey -> pure $ mkEnv apiKey
 
 -- | Construct a 'ClonadEnv' for Anthropic.
-mkEnv :: Text -> ClonadEnv
+mkEnv :: ApiKey -> ClonadEnv
 mkEnv key =
   ClonadEnv
-    { envBackend = Anthropic,
-      envApiKey = key,
-      envModel = "claude-sonnet-4-20250514",
-      envTemperature = Nothing,
-      envMaxTokens = 1024,
-      envSystemPrompt = Nothing
+    { backend = Anthropic,
+      apiKey = key,
+      model = ModelId "claude-sonnet-4-20250514",
+      temperature = Nothing,
+      maxTokens = 1024,
+      systemPrompt = Nothing
     }
 
 -- | Construct a 'ClonadEnv' for Ollama.
-mkOllamaEnv :: Text -> Text -> ClonadEnv
-mkOllamaEnv baseUrl model =
+mkOllamaEnv :: Text -> ModelId -> ClonadEnv
+mkOllamaEnv baseUrl modelId =
   ClonadEnv
-    { envBackend = Ollama baseUrl,
-      envApiKey = "",
-      envModel = model,
-      envTemperature = Nothing,
-      envMaxTokens = 1024,
-      envSystemPrompt = Nothing
+    { backend = Ollama baseUrl,
+      apiKey = ApiKey "", -- Ollama doesn't need an API key
+      model = modelId,
+      temperature = Nothing,
+      maxTokens = 1024,
+      systemPrompt = Nothing
     }
 
 -- | Construct a 'ClonadEnv' for OpenAI or an OpenAI-compatible endpoint.
-mkOpenAIEnv :: Text -> Text -> Maybe Text -> ClonadEnv
-mkOpenAIEnv key model mBaseUrl =
+mkOpenAIEnv :: ApiKey -> ModelId -> Maybe Text -> ClonadEnv
+mkOpenAIEnv key modelId mBaseUrl =
   ClonadEnv
-    { envBackend = OpenAI mBaseUrl,
-      envApiKey = key,
-      envModel = model,
-      envTemperature = Nothing,
-      envMaxTokens = 1024,
-      envSystemPrompt = Nothing
+    { backend = OpenAI mBaseUrl,
+      apiKey = key,
+      model = modelId,
+      temperature = Nothing,
+      maxTokens = 1024,
+      systemPrompt = Nothing
     }
 
 -- ---------------------------------------------------------------------------
@@ -270,7 +387,7 @@ mkOpenAIEnv key model mBaseUrl =
 
 -- | Run a 'Clonad' computation.
 runClonad :: ClonadEnv -> Clonad a -> IO a
-runClonad env = flip runReaderT env . unClonad
+runClonad env (Clonad m) = runReaderT m env
 
 -- ---------------------------------------------------------------------------
 -- The Claude FFI
@@ -312,13 +429,14 @@ clonadWith ::
   [(Text, Text)] ->
   a ->
   Clonad b
-clonadWith spec _context input = Clonad $ ReaderT \env -> do
+clonadWith spec _context input = do
+  env <- ask
   let rspec = returnSpec (Proxy @b)
       serialised = serialise input
       systemMsg =
         T.unlines $
           catMaybes
-            [ envSystemPrompt env,
+            [ env.systemPrompt,
               Just $
                 T.unlines
                   [ "You are a pure computation engine embedded in a Haskell program via FFI.",
@@ -332,19 +450,15 @@ clonadWith spec _context input = Clonad $ ReaderT \env -> do
       userMsg
         | serialised == "()" = spec
         | otherwise = spec <> "\n\nInput:\n" <> serialised
-  rawText <- callLLM env systemMsg userMsg
+  rawText <- liftIO $ callLLM env systemMsg userMsg
   case deserialise @b rawText of
     Left err ->
-      error $
-        "Clonad: failed to parse Claude response.\n"
-          <> "  Spec:     "
-          <> T.unpack spec
-          <> "\n"
-          <> "  Raw:      "
-          <> T.unpack rawText
-          <> "\n"
-          <> "  Error:    "
-          <> err
+      throwM $
+        ClonadParseError
+          { parseSpec = spec,
+            parseRaw = rawText,
+            parseError = err
+          }
     Right val -> pure val
 
 -- ---------------------------------------------------------------------------
@@ -354,7 +468,7 @@ clonadWith spec _context input = Clonad $ ReaderT \env -> do
 -- Anthropic response types
 newtype ApiResponse = ApiResponse [ContentBlock]
 
-data ContentBlock = ContentBlock !Text !Text -- type, text
+data ContentBlock = ContentBlock Text Text -- type, text
 
 instance FromJSON ApiResponse where
   parseJSON = Aeson.withObject "ApiResponse" \o -> ApiResponse <$> o .: "content"
@@ -379,8 +493,42 @@ instance FromJSON OllamaChoice where
 instance FromJSON OllamaMessage where
   parseJSON = Aeson.withObject "OllamaMessage" \o -> OllamaMessage <$> o .: "content"
 
+-- ---------------------------------------------------------------------------
+-- URL Parsing Helper
+-- ---------------------------------------------------------------------------
+
+-- | Parsed URL components for HTTP requests.
+data ParsedUrl = ParsedUrl
+  { scheme :: UrlScheme,
+    host :: Text,
+    portNum :: Int
+  }
+
+-- | URL scheme (HTTP or HTTPS).
+data UrlScheme = UrlHttp | UrlHttps
+  deriving stock (Eq)
+
+-- | Parse a base URL into its components.
+parseBaseUrl :: Text -> Int -> ParsedUrl
+parseBaseUrl baseUrl defaultPort =
+  let stripped = T.dropWhileEnd (== '/') baseUrl
+      (schemeText, rest) = T.breakOn "://" stripped
+      hostPort' = T.drop 3 rest
+      (hostText, portPart) = T.breakOn ":" hostPort'
+      parsedPort = fromMaybe defaultPort $ readMaybe (T.unpack $ T.drop 1 portPart)
+      urlScheme = if schemeText == "https" then UrlHttps else UrlHttp
+   in ParsedUrl
+        { scheme = urlScheme,
+          host = hostText,
+          portNum = parsedPort
+        }
+
+-- ---------------------------------------------------------------------------
+-- Backend Implementations
+-- ---------------------------------------------------------------------------
+
 callLLM :: ClonadEnv -> Text -> Text -> IO Text
-callLLM env systemMsg userMsg = case envBackend env of
+callLLM env systemMsg userMsg = case env.backend of
   Anthropic -> callAnthropic env systemMsg userMsg
   Ollama base -> callOllama env base systemMsg userMsg
   OpenAI mBase -> callOpenAI env mBase systemMsg userMsg
@@ -389,41 +537,38 @@ callAnthropic :: ClonadEnv -> Text -> Text -> IO Text
 callAnthropic env systemMsg userMsg = runReq defaultHttpConfig do
   let url = https "api.anthropic.com" /: "v1" /: "messages"
       headers =
-        header "x-api-key" (TE.encodeUtf8 $ envApiKey env)
+        header "x-api-key" (TE.encodeUtf8 $ unApiKey env.apiKey)
           <> header "anthropic-version" "2023-06-01"
           <> header "content-type" "application/json"
       body =
         object $
-          [ "model" .= envModel env,
-            "max_tokens" .= envMaxTokens env,
+          [ "model" .= unModelId env.model,
+            "max_tokens" .= env.maxTokens,
             "system" .= systemMsg,
             "messages" .= [object ["role" .= ("user" :: Text), "content" .= userMsg]]
           ]
-            <> ["temperature" .= t | Just t <- [envTemperature env]]
+            <> ["temperature" .= unTemperature t | Just t <- [env.temperature]]
   resp <- req POST url (ReqBodyJson body) jsonResponse headers
   let ApiResponse blocks = responseBody resp
   pure $ T.intercalate "\n" [txt | ContentBlock typ txt <- blocks, typ == "text"]
 
 callOllama :: ClonadEnv -> Text -> Text -> Text -> IO Text
 callOllama env baseUrl systemMsg userMsg = runReq defaultHttpConfig do
-  let stripped = T.dropWhileEnd (== '/') baseUrl
-      (scheme, rest) = T.breakOn "://" stripped
-      hostPort = T.drop 3 rest
-      (host, portPart) = T.breakOn ":" hostPort
-      portNum = fromMaybe 11434 $ readMaybe (T.unpack $ T.drop 1 portPart)
+  let parsed = parseBaseUrl baseUrl 11434
       messages =
         [ object ["role" .= ("system" :: Text), "content" .= systemMsg],
           object ["role" .= ("user" :: Text), "content" .= userMsg]
         ]
       body =
         object $
-          ["model" .= envModel env, "messages" .= messages]
-            <> ["temperature" .= t | Just t <- [envTemperature env]]
+          ["model" .= unModelId env.model, "messages" .= messages]
+            <> ["temperature" .= unTemperature t | Just t <- [env.temperature]]
       headers = header "content-type" "application/json"
-  resp <-
-    if scheme == "https"
-      then req POST (https host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
-      else req POST (http host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port portNum)
+  resp <- case parsed.scheme of
+    UrlHttps ->
+      req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
+    UrlHttp ->
+      req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
   let OllamaResponse choices = responseBody resp
   pure $ case choices of
     (OllamaChoice (OllamaMessage content) : _) -> content
@@ -437,9 +582,9 @@ callOpenAI env mBaseUrl systemMsg userMsg = runReq defaultHttpConfig do
         ]
       body =
         object $
-          ["model" .= envModel env, "messages" .= messages]
-            <> ["temperature" .= t | Just t <- [envTemperature env]]
-      authHeader = header "Authorization" ("Bearer " <> TE.encodeUtf8 (envApiKey env))
+          ["model" .= unModelId env.model, "messages" .= messages]
+            <> ["temperature" .= unTemperature t | Just t <- [env.temperature]]
+      authHeader = header "Authorization" ("Bearer " <> TE.encodeUtf8 (unApiKey env.apiKey))
       headers = authHeader <> header "content-type" "application/json"
   resp <- case mBaseUrl of
     Nothing ->
@@ -447,14 +592,12 @@ callOpenAI env mBaseUrl systemMsg userMsg = runReq defaultHttpConfig do
       req POST (https "api.openai.com" /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
     Just baseUrl -> do
       -- Custom OpenAI-compatible endpoint
-      let stripped = T.dropWhileEnd (== '/') baseUrl
-          (scheme, rest) = T.breakOn "://" stripped
-          hostPort = T.drop 3 rest
-          (host, portPart) = T.breakOn ":" hostPort
-          portNum = fromMaybe 443 $ readMaybe (T.unpack $ T.drop 1 portPart)
-      if scheme == "https"
-        then req POST (https host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
-        else req POST (http host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port portNum)
+      let parsed = parseBaseUrl baseUrl 443
+      case parsed.scheme of
+        UrlHttps ->
+          req POST (https parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse headers
+        UrlHttp ->
+          req POST (http parsed.host /: "v1" /: "chat" /: "completions") (ReqBodyJson body) jsonResponse (headers <> port parsed.portNum)
   let OllamaResponse choices = responseBody resp
   pure $ case choices of
     (OllamaChoice (OllamaMessage content) : _) -> content
@@ -478,13 +621,13 @@ stripCodeFences t = case T.lines (T.strip t) of
 -- ---------------------------------------------------------------------------
 
 -- | Locally override the model.
-withModel :: Text -> Clonad a -> Clonad a
-withModel m = local \e -> e {envModel = m}
+withModel :: ModelId -> Clonad a -> Clonad a
+withModel m = local \e -> e {model = m}
 
 -- | Locally override the temperature.
-withTemperature :: Double -> Clonad a -> Clonad a
-withTemperature t = local \e -> e {envTemperature = Just t}
+withTemperature :: Temperature -> Clonad a -> Clonad a
+withTemperature t = local \e -> e {temperature = Just t}
 
 -- | Locally set a system prompt.
 withSystemPrompt :: Text -> Clonad a -> Clonad a
-withSystemPrompt s = local \e -> e {envSystemPrompt = Just s}
+withSystemPrompt s = local \e -> e {systemPrompt = Just s}
